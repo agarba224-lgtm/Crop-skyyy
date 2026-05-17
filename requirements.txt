@@ -1,0 +1,9 @@
+flask
+requests
+openai
+werkzeug
+pytz
+flask-limiter
+pyserial
+twilio
+gunicorn
