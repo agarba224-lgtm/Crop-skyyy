@@ -9,6 +9,646 @@ Features:
   6. Real Arduino Sensor Support
 """
 
+import os
+import json
+import random
+import sqlite3
+import threading
+import time
+import logging
+from datetime import datetime
+
+import requests as req
+from flask import Flask, jsonify, request, session
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("cropskyyy")
+
+# ---------------------------------------------------------------------------
+# Optional imports - graceful fallback if packages not installed
+# ---------------------------------------------------------------------------
+try:
+    from openai import OpenAI
+    OPENAI_OK = True
+except ImportError:
+    OPENAI_OK = False
+    log.warning("openai not installed - AI features disabled. Run: pip install openai")
+
+try:
+    import serial
+    SERIAL_OK = True
+except ImportError:
+    SERIAL_OK = False
+
+try:
+    from twilio.rest import Client as TwilioClient
+    TWILIO_OK = True
+except ImportError:
+    TWILIO_OK = False
+
+try:
+    from werkzeug.security import generate_password_hash, check_password_hash
+    WERKZEUG_OK = True
+except ImportError:
+    WERKZEUG_OK = False
+    log.warning("werkzeug not found - falling back to sha256 hashing")
+
+try:
+    import pytz
+    PYTZ_OK = True
+except ImportError:
+    PYTZ_OK = False
+    log.warning("pytz not installed - timezone conversion disabled. Run: pip install pytz")
+
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    LIMITER_OK = True
+except ImportError:
+    LIMITER_OK = False
+    log.warning("flask-limiter not installed - rate limiting disabled. Run: pip install flask-limiter")
+
+# ---------------------------------------------------------------------------
+# CONFIG - Edit these values or set as environment variables
+# ---------------------------------------------------------------------------
+
+# --- API Keys (unchanged from original) ---
+OWM_KEY    = "2f125e80f1a3689c2397593b7ad989a0"
+OPENAI_KEY = "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"
+
+# --- Twilio WhatsApp / SMS (sign up free at twilio.com) ---
+TWILIO_SID   = "YOUR_TWILIO_ACCOUNT_SID"
+TWILIO_TOKEN = "YOUR_TWILIO_AUTH_TOKEN"
+TWILIO_FROM  = "whatsapp:+14155238886"
+ALERT_PHONE  = "+2348012345678"
+
+# --- Arduino ---
+ARDUINO_PORT = "COM3"
+ARDUINO_BAUD = 9600
+USE_ARDUINO  = False   # Set True when Arduino is physically connected
+
+# --- Environment variable overrides (recommended for production) ---
+# Set SECRET_KEY in your environment: set SECRET_KEY=your_random_secret
+# Set OPENAI_MODEL in your environment: set OPENAI_MODEL=gpt-4o
+SECRET_KEY   = os.getenv("SECRET_KEY", "cropskyyy_v3_secret_2024_change_in_prod")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+# --- Timezone (Nigeria) ---
+TIMEZONE = "Africa/Lagos"
+
+# ---------------------------------------------------------------------------
+# Flask App
+# ---------------------------------------------------------------------------
+app = Flask(__name__, static_folder="static")
+app.secret_key = SECRET_KEY
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"]   = False  # Set True in production with HTTPS
+
+# --- Rate Limiter ---
+if LIMITER_OK:
+    limiter = Limiter(
+        key_func=get_remote_address,
+        app=app,
+        default_limits=[],
+        storage_uri="memory://",
+    )
+    log.info("Rate limiting enabled")
+
+# --- AI and Twilio clients ---
+ai_client     = OpenAI(api_key=OPENAI_KEY) if OPENAI_OK else None
+twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_OK else None
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cropskyyy_v3.db")
+
+def get_db():
+    """
+    Return a thread-safe SQLite connection.
+    check_same_thread=False is safe here because we use explicit conn.close()
+    and never share connection objects between threads.
+    WAL mode reduces locking contention from background threads.
+    """
+    conn = sqlite3.connect(DB, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")  # wait up to 5s instead of failing instantly
+    return conn
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+
+    # Users
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        phone TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Sensor + weather logs - includes username for data isolation
+    c.execute("""CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT DEFAULT '',
+        city TEXT, moisture INTEGER, pump_on INTEGER,
+        advice TEXT, temp REAL, humidity INTEGER,
+        rain REAL DEFAULT 0, alert_sent INTEGER DEFAULT 0,
+        logged_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Weather cache
+    c.execute("""CREATE TABLE IF NOT EXISTS weather_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        city TEXT, temp REAL, humidity INTEGER,
+        description TEXT, wind_speed REAL, feels_like REAL,
+        pressure INTEGER, clouds INTEGER, rain_1h REAL DEFAULT 0,
+        icon TEXT, fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Scheduled irrigation - includes username for data isolation
+    c.execute("""CREATE TABLE IF NOT EXISTS schedules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT DEFAULT '',
+        name TEXT NOT NULL,
+        city TEXT DEFAULT 'Kaduna',
+        run_time TEXT NOT NULL,
+        days TEXT NOT NULL,
+        duration_min INTEGER DEFAULT 20,
+        active INTEGER DEFAULT 1,
+        last_run TEXT DEFAULT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Alert settings per user
+    c.execute("""CREATE TABLE IF NOT EXISTS alert_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        whatsapp_enabled INTEGER DEFAULT 0,
+        sms_enabled INTEGER DEFAULT 0,
+        phone TEXT DEFAULT '',
+        alert_critical INTEGER DEFAULT 1,
+        alert_rain INTEGER DEFAULT 1,
+        alert_schedule INTEGER DEFAULT 1
+    )""")
+
+    conn.commit()
+    conn.close()
+    log.info("Database ready: %s", DB)
+
+init_db()
+
+# ---------------------------------------------------------------------------
+# Password Helpers
+# ---------------------------------------------------------------------------
+def hash_password(pw: str) -> str:
+    """Hash password using Werkzeug (bcrypt-style salted hash) if available,
+    otherwise fall back to sha256. New registrations always use Werkzeug."""
+    if WERKZEUG_OK:
+        return generate_password_hash(pw)
+    import hashlib
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def verify_password(pw: str, stored_hash: str) -> bool:
+    """Verify password against stored hash. Handles both Werkzeug hashes
+    and legacy sha256 hashes transparently."""
+    if WERKZEUG_OK:
+        # Werkzeug hashes start with 'pbkdf2:' or 'scrypt:'
+        if stored_hash.startswith("pbkdf2:") or stored_hash.startswith("scrypt:"):
+            return check_password_hash(stored_hash, pw)
+        # Legacy sha256 hash - compare directly
+        import hashlib
+        return hashlib.sha256(pw.encode()).hexdigest() == stored_hash
+    import hashlib
+    return hashlib.sha256(pw.encode()).hexdigest() == stored_hash
+
+# ---------------------------------------------------------------------------
+# Timezone Helper
+# ---------------------------------------------------------------------------
+def utc_ts_to_local(timestamp: int) -> str:
+    """Convert a UTC Unix timestamp to local time string (Africa/Lagos)."""
+    dt_utc = datetime.utcfromtimestamp(timestamp)
+    if PYTZ_OK:
+        try:
+            tz    = pytz.timezone(TIMEZONE)
+            dt_utc = pytz.utc.localize(dt_utc)
+            dt_local = dt_utc.astimezone(tz)
+            return dt_local.strftime("%H:%M")
+        except Exception as e:
+            log.warning("Timezone conversion failed: %s", e)
+    return dt_utc.strftime("%H:%M")
+
+# ---------------------------------------------------------------------------
+# Arduino (Feature 6)
+# ---------------------------------------------------------------------------
+arduino_conn = None
+arduino_lock = threading.Lock()
+
+def connect_arduino() -> bool:
+    global arduino_conn
+    if not SERIAL_OK or not USE_ARDUINO:
+        return False
+    try:
+        with arduino_lock:
+            if arduino_conn and arduino_conn.is_open:
+                return True
+            arduino_conn = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=2)
+            time.sleep(2)
+            log.info("Arduino connected on %s", ARDUINO_PORT)
+            return True
+    except Exception as e:
+        log.error("Arduino connection failed: %s", e)
+        arduino_conn = None
+        return False
+
+def read_soil_moisture() -> int:
+    """
+    Read soil moisture from Arduino or simulate it.
+
+    Arduino sketch should send a number (0-100) followed by newline:
+        int sensorPin = A0;
+        void setup() { Serial.begin(9600); }
+        void loop() {
+            int raw = analogRead(sensorPin);
+            int pct = map(raw, 1023, 300, 0, 100);
+            pct = constrain(pct, 0, 100);
+            Serial.println(pct);
+            delay(2000);
+        }
+    """
+    global arduino_conn
+    if USE_ARDUINO and connect_arduino():
+        try:
+            with arduino_lock:
+                arduino_conn.flushInput()
+                line = arduino_conn.readline().decode("utf-8").strip()
+                if line.isdigit():
+                    val = int(line)
+                    if 0 <= val <= 100:
+                        log.info("Arduino soil moisture: %d%%", val)
+                        return val
+        except Exception as e:
+            log.error("Arduino read error: %s", e)
+            arduino_conn = None
+    return random.randint(20, 85)
+
+def control_pump(turn_on: bool):
+    """
+    Send ON/OFF command to Arduino pump relay.
+
+    Arduino should listen for 'PUMP_ON\n' or 'PUMP_OFF\n':
+        if (Serial.available()) {
+            String cmd = Serial.readStringUntil('\n');
+            if (cmd == "PUMP_ON")  digitalWrite(relayPin, HIGH);
+            if (cmd == "PUMP_OFF") digitalWrite(relayPin, LOW);
+        }
+    """
+    global arduino_conn
+    state = "ON" if turn_on else "OFF"
+    if USE_ARDUINO and connect_arduino():
+        try:
+            with arduino_lock:
+                cmd = b"PUMP_ON\n" if turn_on else b"PUMP_OFF\n"
+                arduino_conn.write(cmd)
+                log.info("Arduino pump %s command sent", state)
+        except Exception as e:
+            log.error("Arduino pump control error: %s", e)
+    else:
+        log.info("Pump %s (simulated)", state)
+
+def get_arduino_status() -> dict:
+    if not USE_ARDUINO:
+        return {"connected": False, "mode": "simulated",
+                "message": "Running in simulation mode (no Arduino)"}
+    if connect_arduino():
+        return {"connected": True, "mode": "hardware",
+                "port": ARDUINO_PORT,
+                "message": f"Arduino connected on {ARDUINO_PORT}"}
+    return {"connected": False, "mode": "error",
+            "message": f"Cannot connect to Arduino on {ARDUINO_PORT}"}
+
+# ---------------------------------------------------------------------------
+# WhatsApp / SMS Alerts (Feature 2)
+# ---------------------------------------------------------------------------
+def send_whatsapp(phone: str, message: str) -> dict:
+    if not TWILIO_OK or not twilio_client:
+        log.info("[WHATSAPP SIM] Would send to %s", phone)
+        return {"sent": False, "reason": "Twilio not configured"}
+    try:
+        msg = twilio_client.messages.create(
+            body=message, from_=TWILIO_FROM, to=f"whatsapp:{phone}")
+        log.info("WhatsApp sent to %s: %s", phone, msg.sid)
+        return {"sent": True, "sid": msg.sid}
+    except Exception as e:
+        log.error("WhatsApp send failed: %s", e)
+        return {"sent": False, "reason": str(e)}
+
+def send_sms(phone: str, message: str) -> dict:
+    if not TWILIO_OK or not twilio_client:
+        log.info("[SMS SIM] Would send to %s", phone)
+        return {"sent": False, "reason": "Twilio not configured"}
+    try:
+        msg = twilio_client.messages.create(
+            body=message,
+            from_=TWILIO_FROM.replace("whatsapp:", ""),
+            to=phone)
+        return {"sent": True, "sid": msg.sid}
+    except Exception as e:
+        log.error("SMS send failed: %s", e)
+        return {"sent": False, "reason": str(e)}
+
+def build_alert_message(alert_type: str, city: str, soil: int,
+                        temp: float, advice: str) -> str:
+    now = datetime.now().strftime("%d %b %Y %H:%M")
+    if alert_type == "critical":
+        return (f"CROP SKYYY CRITICAL ALERT\n"
+                f"Farm: {city}\nTime: {now}\n\n"
+                f"URGENT: Soil moisture critically low!\n"
+                f"Soil: {soil}%  Temp: {temp}C\n\n"
+                f"Action: {advice}\n\n"
+                f"Irrigate immediately to prevent crop damage!")
+    if alert_type == "rain":
+        return (f"CROP SKYYY RAIN ALERT\n"
+                f"Farm: {city} | {now}\n\n"
+                f"Rain detected - irrigation has been paused.\n"
+                f"Soil: {soil}% | No watering needed today.\n\n"
+                f"Your crops are being watered naturally!")
+    if alert_type == "schedule":
+        return (f"CROP SKYYY SCHEDULE ALERT\n"
+                f"Farm: {city} | {now}\n\n"
+                f"Scheduled irrigation is starting now.\n"
+                f"Soil: {soil}% | Temp: {temp}C\n\n"
+                f"Pump activated as per your schedule.")
+    return f"Crop Skyyy Alert - {advice}"
+
+def maybe_send_alert(username: str, alert_type: str, city: str,
+                     soil: int, temp: float, advice: str):
+    try:
+        conn = get_db()
+        row  = conn.execute(
+            "SELECT * FROM alert_settings WHERE username=?", (username,)
+        ).fetchone()
+        conn.close()
+    except Exception as e:
+        log.error("Alert settings lookup failed: %s", e)
+        return
+
+    if not row:
+        return
+
+    should_send = (
+        (alert_type == "critical" and row["alert_critical"]) or
+        (alert_type == "rain"     and row["alert_rain"])     or
+        (alert_type == "schedule" and row["alert_schedule"])
+    )
+    if not should_send:
+        return
+
+    phone   = row["phone"]
+    message = build_alert_message(alert_type, city, soil, temp, advice)
+
+    if row["whatsapp_enabled"] and phone:
+        threading.Thread(
+            target=send_whatsapp, args=(phone, message), daemon=True
+        ).start()
+
+    if row["sms_enabled"] and phone:
+        threading.Thread(
+            target=send_sms, args=(phone, message), daemon=True
+        ).start()
+
+# ---------------------------------------------------------------------------
+# Scheduled Irrigation (Feature 4)
+# ---------------------------------------------------------------------------
+_scheduler_started = threading.Event()   # prevents duplicate scheduler threads
+
+def run_schedule(schedule: dict):
+    city     = schedule["city"]
+    duration = schedule["duration_min"]
+    name     = schedule["name"]
+    log.info("Running schedule: %s for %d min in %s", name, duration, city)
+
+    try:
+        w    = fetch_weather(city)
+        soil = read_soil_moisture()
+    except Exception as e:
+        log.warning("Schedule %s: could not fetch conditions: %s", name, e)
+        soil = 50
+        w    = {"temp": 25, "humidity": 60, "rain_1h": 0, "description": "Unknown"}
+
+    if w.get("rain_1h", 0) > 2:
+        log.info("Schedule %s skipped - rain detected", name)
+        return
+    if soil > 70:
+        log.info("Schedule %s skipped - soil already moist (%d%%)", name, soil)
+        return
+
+    control_pump(True)
+
+    try:
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO logs (city, moisture, pump_on, advice, temp, humidity, rain)
+               VALUES (?, ?, 1, ?, ?, ?, ?)""",
+            (city, soil, f"Scheduled: {name}", w["temp"],
+             w["humidity"], w.get("rain_1h", 0)))
+        conn.execute(
+            "UPDATE schedules SET last_run=? WHERE id=?",
+            (datetime.now().strftime("%Y-%m-%d %H:%M"), schedule["id"]))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("Schedule %s: DB write failed: %s", name, e)
+
+    def stop_after_duration():
+        time.sleep(duration * 60)
+        control_pump(False)
+        log.info("Schedule %s completed after %d min", name, duration)
+
+    threading.Thread(target=stop_after_duration, daemon=True).start()
+
+def scheduler_loop():
+    """
+    Background scheduler - checks active schedules every minute.
+    The _scheduler_started Event ensures only ONE instance ever runs,
+    even if the module is imported multiple times (e.g. with gunicorn --preload).
+    """
+    log.info("Background scheduler started")
+
+    while True:
+        try:
+            now      = datetime.now()
+            now_time = now.strftime("%H:%M")
+            now_day  = now.strftime("%a")
+
+            conn      = get_db()
+            schedules = conn.execute(
+                "SELECT * FROM schedules WHERE active=1"
+            ).fetchall()
+            conn.close()
+
+            for s in schedules:
+                s    = dict(s)
+                days = json.loads(s["days"])
+                if s["run_time"] == now_time and now_day in days:
+                    last = s.get("last_run") or ""
+                    if not last.startswith(now.strftime("%Y-%m-%d %H:%M")):
+                        threading.Thread(
+                            target=run_schedule, args=(s,), daemon=True
+                        ).start()
+
+        except Exception as e:
+            log.error("Scheduler loop error: %s", e)
+
+        time.sleep(60)
+
+def start_scheduler_once():
+    """Start the scheduler thread only if it has not been started yet."""
+    if not _scheduler_started.is_set():
+        _scheduler_started.set()
+        threading.Thread(target=scheduler_loop, daemon=True).start()
+
+start_scheduler_once()
+
+# ---------------------------------------------------------------------------
+# Weather Helpers
+# ---------------------------------------------------------------------------
+def fetch_weather(city: str) -> dict:
+    r = req.get(
+        "https://api.openweathermap.org/data/2.5/weather",
+        params={"q": city, "appid": OWM_KEY, "units": "metric"},
+        timeout=8)
+    r.raise_for_status()
+    d = r.json()
+    w = {
+        "city":        d["name"],
+        "country":     d["sys"]["country"],
+        "temp":        round(d["main"]["temp"], 1),
+        "feels_like":  round(d["main"]["feels_like"], 1),
+        "humidity":    d["main"]["humidity"],
+        "description": d["weather"][0]["description"].title(),
+        "icon":        d["weather"][0]["icon"],
+        "wind_speed":  round(d["wind"]["speed"] * 3.6, 1),
+        "pressure":    d["main"]["pressure"],
+        "clouds":      d["clouds"]["all"],
+        "rain_1h":     d.get("rain", {}).get("1h", 0),
+        # Sunrise/sunset converted to Nigeria local time (Africa/Lagos)
+        "sunrise":     utc_ts_to_local(d["sys"]["sunrise"]),
+        "sunset":      utc_ts_to_local(d["sys"]["sunset"]),
+        "online":      True,
+    }
+    try:
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO weather_cache
+               (city,temp,humidity,description,wind_speed,feels_like,
+                pressure,clouds,rain_1h,icon)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (w["city"], w["temp"], w["humidity"], w["description"],
+             w["wind_speed"], w["feels_like"], w["pressure"],
+             w["clouds"], w["rain_1h"], w["icon"]))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error("Weather cache write failed: %s", e)
+    return w
+
+def fetch_forecast(city: str) -> list:
+    r = req.get(
+        "https://api.openweathermap.org/data/2.5/forecast",
+        params={"q": city, "appid": OWM_KEY, "units": "metric", "cnt": 40},
+        timeout=8)
+    r.raise_for_status()
+    data  = r.json()
+    daily = {}
+    for item in data["list"]:
+        day = item["dt_txt"].split()[0]
+        if day not in daily:
+            daily[day] = {
+                "temps": [], "hum": [], "rain": 0,
+                "icon": item["weather"][0]["icon"],
+                "desc": item["weather"][0]["description"].title(),
+            }
+        daily[day]["temps"].append(item["main"]["temp"])
+        daily[day]["hum"].append(item["main"]["humidity"])
+        daily[day]["rain"] += item.get("rain", {}).get("3h", 0)
+    out = []
+    for day, d in list(daily.items())[:7]:
+        out.append({
+            "day":      datetime.strptime(day, "%Y-%m-%d").strftime("%a %d"),
+            "temp_max": round(max(d["temps"]), 1),
+            "temp_min": round(min(d["temps"]), 1),
+            "humidity": round(sum(d["hum"]) / len(d["hum"])),
+            "rain_mm":  round(d["rain"], 1),
+            "icon":     d["icon"],
+            "desc":     d["desc"],
+        })
+    return out
+
+def get_cached_weather() -> dict | None:
+    try:
+        conn = get_db()
+        row  = conn.execute(
+            "SELECT * FROM weather_cache ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            d = dict(row); d["online"] = False; return d
+    except Exception as e:
+        log.error("Cached weather lookup failed: %s", e)
+    return None
+
+def rule_advice(temp, humidity, soil, rain):
+    if rain > 2:
+        return "Rain detected - skip irrigation", False, "rain"
+    if soil < 25 and temp > 32:
+        return "Critical: max irrigation needed immediately!", True, "critical"
+    if soil < 35:
+        return "High irrigation needed - soil very dry", True, None
+    if soil < 50:
+        return "Moderate irrigation recommended", True, None
+    if soil > 70:
+        return "Soil well-moistened - no irrigation needed", False, None
+    if humidity > 85:
+        return "High humidity - skip irrigation", False, None
+    return "Light irrigation recommended", False, None
+
+def gpt_advice(temp, humidity, soil, rain, desc, city) -> str:
+    if not ai_client:
+        return "Install OpenAI: pip install openai"
+    try:
+        r = ai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content":
+                f"You are AquaMind, AI irrigation advisor for Crop Skyyy.\n"
+                f"Farm: {city} | Temp:{temp}C | Humidity:{humidity}% | "
+                f"Soil:{soil}% | Rain:{rain}mm | Weather:{desc}\n"
+                f"Give 2-3 sentence practical irrigation advice. Include: "
+                f"irrigate yes/no, best timing, one water-saving tip."}],
+            max_tokens=180,
+            temperature=0.6,
+        )
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        log.error("GPT advice failed: %s", e)
+        return f"AI advice unavailable: {e}"
+
+# ---------------------------------------------------------------------------
+# Routes - Auth
+# ---------------------------------------------------------------------------
+@app.route("/")
+def index():
+    return HTML_PAGE, 200, {"Content-Type": "text/html; charset=utf-8"}
+
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1375,651 +2015,6 @@ def api_arduino_status():
 def api_arduino_test():
     """Test pump with a 2-second pulse. Runs in background so it does not
     block the HTTP response."""
-
-
-import os
-import json
-import random
-import sqlite3
-import threading
-import time
-import logging
-from datetime import datetime
-
-import requests as req
-from flask import Flask, jsonify, request, session, make_response
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("cropskyyy")
-
-# ---------------------------------------------------------------------------
-# Optional imports - graceful fallback if packages not installed
-# ---------------------------------------------------------------------------
-try:
-    from openai import OpenAI
-    OPENAI_OK = True
-except ImportError:
-    OPENAI_OK = False
-    log.warning("openai not installed - AI features disabled. Run: pip install openai")
-
-try:
-    import serial
-    SERIAL_OK = True
-except ImportError:
-    SERIAL_OK = False
-
-try:
-    from twilio.rest import Client as TwilioClient
-    TWILIO_OK = True
-except ImportError:
-    TWILIO_OK = False
-
-try:
-    from werkzeug.security import generate_password_hash, check_password_hash
-    WERKZEUG_OK = True
-except ImportError:
-    WERKZEUG_OK = False
-    log.warning("werkzeug not found - falling back to sha256 hashing")
-
-try:
-    import pytz
-    PYTZ_OK = True
-except ImportError:
-    PYTZ_OK = False
-    log.warning("pytz not installed - timezone conversion disabled. Run: pip install pytz")
-
-try:
-    from flask_limiter import Limiter
-    from flask_limiter.util import get_remote_address
-    LIMITER_OK = True
-except ImportError:
-    LIMITER_OK = False
-    log.warning("flask-limiter not installed - rate limiting disabled. Run: pip install flask-limiter")
-
-# ---------------------------------------------------------------------------
-# CONFIG - Edit these values or set as environment variables
-# ---------------------------------------------------------------------------
-
-# --- API Keys (unchanged from original) ---
-OWM_KEY    = "2f125e80f1a3689c2397593b7ad989a0"
-OPENAI_KEY = "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"
-
-# --- Twilio WhatsApp / SMS (sign up free at twilio.com) ---
-TWILIO_SID   = "YOUR_TWILIO_ACCOUNT_SID"
-TWILIO_TOKEN = "YOUR_TWILIO_AUTH_TOKEN"
-TWILIO_FROM  = "whatsapp:+14155238886"
-ALERT_PHONE  = "+2348012345678"
-
-# --- Arduino ---
-ARDUINO_PORT = "COM3"
-ARDUINO_BAUD = 9600
-USE_ARDUINO  = False   # Set True when Arduino is physically connected
-
-# --- Environment variable overrides (recommended for production) ---
-# Set SECRET_KEY in your environment: set SECRET_KEY=your_random_secret
-# Set OPENAI_MODEL in your environment: set OPENAI_MODEL=gpt-4o
-SECRET_KEY   = os.getenv("SECRET_KEY", "cropskyyy_v3_secret_2024_change_in_prod")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-
-# --- Timezone (Nigeria) ---
-TIMEZONE = "Africa/Lagos"
-
-# ---------------------------------------------------------------------------
-# Flask App
-# ---------------------------------------------------------------------------
-app = Flask(__name__, static_folder="static")
-app.secret_key = SECRET_KEY
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"]   = False  # Set True in production with HTTPS
-
-# --- Rate Limiter ---
-if LIMITER_OK:
-    limiter = Limiter(
-        key_func=get_remote_address,
-        app=app,
-        default_limits=[],
-        storage_uri="memory://",
-    )
-    log.info("Rate limiting enabled")
-
-# --- AI and Twilio clients ---
-ai_client     = OpenAI(api_key=OPENAI_KEY) if OPENAI_OK else None
-twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_OK else None
-
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cropskyyy_v3.db")
-
-def get_db():
-    """
-    Return a thread-safe SQLite connection.
-    check_same_thread=False is safe here because we use explicit conn.close()
-    and never share connection objects between threads.
-    WAL mode reduces locking contention from background threads.
-    """
-    conn = sqlite3.connect(DB, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")  # wait up to 5s instead of failing instantly
-    return conn
-
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-
-    # Users
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        phone TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    # Sensor + weather logs - includes username for data isolation
-    c.execute("""CREATE TABLE IF NOT EXISTS logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT DEFAULT '',
-        city TEXT, moisture INTEGER, pump_on INTEGER,
-        advice TEXT, temp REAL, humidity INTEGER,
-        rain REAL DEFAULT 0, alert_sent INTEGER DEFAULT 0,
-        logged_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    # Weather cache
-    c.execute("""CREATE TABLE IF NOT EXISTS weather_cache (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        city TEXT, temp REAL, humidity INTEGER,
-        description TEXT, wind_speed REAL, feels_like REAL,
-        pressure INTEGER, clouds INTEGER, rain_1h REAL DEFAULT 0,
-        icon TEXT, fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    # Scheduled irrigation - includes username for data isolation
-    c.execute("""CREATE TABLE IF NOT EXISTS schedules (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT DEFAULT '',
-        name TEXT NOT NULL,
-        city TEXT DEFAULT 'Kaduna',
-        run_time TEXT NOT NULL,
-        days TEXT NOT NULL,
-        duration_min INTEGER DEFAULT 20,
-        active INTEGER DEFAULT 1,
-        last_run TEXT DEFAULT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    # Alert settings per user
-    c.execute("""CREATE TABLE IF NOT EXISTS alert_settings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        whatsapp_enabled INTEGER DEFAULT 0,
-        sms_enabled INTEGER DEFAULT 0,
-        phone TEXT DEFAULT '',
-        alert_critical INTEGER DEFAULT 1,
-        alert_rain INTEGER DEFAULT 1,
-        alert_schedule INTEGER DEFAULT 1
-    )""")
-
-    conn.commit()
-    conn.close()
-    log.info("Database ready: %s", DB)
-
-init_db()
-
-# ---------------------------------------------------------------------------
-# Password Helpers
-# ---------------------------------------------------------------------------
-def hash_password(pw: str) -> str:
-    """Hash password using Werkzeug (bcrypt-style salted hash) if available,
-    otherwise fall back to sha256. New registrations always use Werkzeug."""
-    if WERKZEUG_OK:
-        return generate_password_hash(pw)
-    import hashlib
-    return hashlib.sha256(pw.encode()).hexdigest()
-
-def verify_password(pw: str, stored_hash: str) -> bool:
-    """Verify password against stored hash. Handles both Werkzeug hashes
-    and legacy sha256 hashes transparently."""
-    if WERKZEUG_OK:
-        # Werkzeug hashes start with 'pbkdf2:' or 'scrypt:'
-        if stored_hash.startswith("pbkdf2:") or stored_hash.startswith("scrypt:"):
-            return check_password_hash(stored_hash, pw)
-        # Legacy sha256 hash - compare directly
-        import hashlib
-        return hashlib.sha256(pw.encode()).hexdigest() == stored_hash
-    import hashlib
-    return hashlib.sha256(pw.encode()).hexdigest() == stored_hash
-
-# ---------------------------------------------------------------------------
-# Timezone Helper
-# ---------------------------------------------------------------------------
-def utc_ts_to_local(timestamp: int) -> str:
-    """Convert a UTC Unix timestamp to local time string (Africa/Lagos)."""
-    dt_utc = datetime.utcfromtimestamp(timestamp)
-    if PYTZ_OK:
-        try:
-            tz    = pytz.timezone(TIMEZONE)
-            dt_utc = pytz.utc.localize(dt_utc)
-            dt_local = dt_utc.astimezone(tz)
-            return dt_local.strftime("%H:%M")
-        except Exception as e:
-            log.warning("Timezone conversion failed: %s", e)
-    return dt_utc.strftime("%H:%M")
-
-# ---------------------------------------------------------------------------
-# Arduino (Feature 6)
-# ---------------------------------------------------------------------------
-arduino_conn = None
-arduino_lock = threading.Lock()
-
-def connect_arduino() -> bool:
-    global arduino_conn
-    if not SERIAL_OK or not USE_ARDUINO:
-        return False
-    try:
-        with arduino_lock:
-            if arduino_conn and arduino_conn.is_open:
-                return True
-            arduino_conn = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=2)
-            time.sleep(2)
-            log.info("Arduino connected on %s", ARDUINO_PORT)
-            return True
-    except Exception as e:
-        log.error("Arduino connection failed: %s", e)
-        arduino_conn = None
-        return False
-
-def read_soil_moisture() -> int:
-    """
-    Read soil moisture from Arduino or simulate it.
-
-    Arduino sketch should send a number (0-100) followed by newline:
-        int sensorPin = A0;
-        void setup() { Serial.begin(9600); }
-        void loop() {
-            int raw = analogRead(sensorPin);
-            int pct = map(raw, 1023, 300, 0, 100);
-            pct = constrain(pct, 0, 100);
-            Serial.println(pct);
-            delay(2000);
-        }
-    """
-    global arduino_conn
-    if USE_ARDUINO and connect_arduino():
-        try:
-            with arduino_lock:
-                arduino_conn.flushInput()
-                line = arduino_conn.readline().decode("utf-8").strip()
-                if line.isdigit():
-                    val = int(line)
-                    if 0 <= val <= 100:
-                        log.info("Arduino soil moisture: %d%%", val)
-                        return val
-        except Exception as e:
-            log.error("Arduino read error: %s", e)
-            arduino_conn = None
-    return random.randint(20, 85)
-
-def control_pump(turn_on: bool):
-    """
-    Send ON/OFF command to Arduino pump relay.
-
-    Arduino should listen for 'PUMP_ON\n' or 'PUMP_OFF\n':
-        if (Serial.available()) {
-            String cmd = Serial.readStringUntil('\n');
-            if (cmd == "PUMP_ON")  digitalWrite(relayPin, HIGH);
-            if (cmd == "PUMP_OFF") digitalWrite(relayPin, LOW);
-        }
-    """
-    global arduino_conn
-    state = "ON" if turn_on else "OFF"
-    if USE_ARDUINO and connect_arduino():
-        try:
-            with arduino_lock:
-                cmd = b"PUMP_ON\n" if turn_on else b"PUMP_OFF\n"
-                arduino_conn.write(cmd)
-                log.info("Arduino pump %s command sent", state)
-        except Exception as e:
-            log.error("Arduino pump control error: %s", e)
-    else:
-        log.info("Pump %s (simulated)", state)
-
-def get_arduino_status() -> dict:
-    if not USE_ARDUINO:
-        return {"connected": False, "mode": "simulated",
-                "message": "Running in simulation mode (no Arduino)"}
-    if connect_arduino():
-        return {"connected": True, "mode": "hardware",
-                "port": ARDUINO_PORT,
-                "message": f"Arduino connected on {ARDUINO_PORT}"}
-    return {"connected": False, "mode": "error",
-            "message": f"Cannot connect to Arduino on {ARDUINO_PORT}"}
-
-# ---------------------------------------------------------------------------
-# WhatsApp / SMS Alerts (Feature 2)
-# ---------------------------------------------------------------------------
-def send_whatsapp(phone: str, message: str) -> dict:
-    if not TWILIO_OK or not twilio_client:
-        log.info("[WHATSAPP SIM] Would send to %s", phone)
-        return {"sent": False, "reason": "Twilio not configured"}
-    try:
-        msg = twilio_client.messages.create(
-            body=message, from_=TWILIO_FROM, to=f"whatsapp:{phone}")
-        log.info("WhatsApp sent to %s: %s", phone, msg.sid)
-        return {"sent": True, "sid": msg.sid}
-    except Exception as e:
-        log.error("WhatsApp send failed: %s", e)
-        return {"sent": False, "reason": str(e)}
-
-def send_sms(phone: str, message: str) -> dict:
-    if not TWILIO_OK or not twilio_client:
-        log.info("[SMS SIM] Would send to %s", phone)
-        return {"sent": False, "reason": "Twilio not configured"}
-    try:
-        msg = twilio_client.messages.create(
-            body=message,
-            from_=TWILIO_FROM.replace("whatsapp:", ""),
-            to=phone)
-        return {"sent": True, "sid": msg.sid}
-    except Exception as e:
-        log.error("SMS send failed: %s", e)
-        return {"sent": False, "reason": str(e)}
-
-def build_alert_message(alert_type: str, city: str, soil: int,
-                        temp: float, advice: str) -> str:
-    now = datetime.now().strftime("%d %b %Y %H:%M")
-    if alert_type == "critical":
-        return (f"CROP SKYYY CRITICAL ALERT\n"
-                f"Farm: {city}\nTime: {now}\n\n"
-                f"URGENT: Soil moisture critically low!\n"
-                f"Soil: {soil}%  Temp: {temp}C\n\n"
-                f"Action: {advice}\n\n"
-                f"Irrigate immediately to prevent crop damage!")
-    if alert_type == "rain":
-        return (f"CROP SKYYY RAIN ALERT\n"
-                f"Farm: {city} | {now}\n\n"
-                f"Rain detected - irrigation has been paused.\n"
-                f"Soil: {soil}% | No watering needed today.\n\n"
-                f"Your crops are being watered naturally!")
-    if alert_type == "schedule":
-        return (f"CROP SKYYY SCHEDULE ALERT\n"
-                f"Farm: {city} | {now}\n\n"
-                f"Scheduled irrigation is starting now.\n"
-                f"Soil: {soil}% | Temp: {temp}C\n\n"
-                f"Pump activated as per your schedule.")
-    return f"Crop Skyyy Alert - {advice}"
-
-def maybe_send_alert(username: str, alert_type: str, city: str,
-                     soil: int, temp: float, advice: str):
-    try:
-        conn = get_db()
-        row  = conn.execute(
-            "SELECT * FROM alert_settings WHERE username=?", (username,)
-        ).fetchone()
-        conn.close()
-    except Exception as e:
-        log.error("Alert settings lookup failed: %s", e)
-        return
-
-    if not row:
-        return
-
-    should_send = (
-        (alert_type == "critical" and row["alert_critical"]) or
-        (alert_type == "rain"     and row["alert_rain"])     or
-        (alert_type == "schedule" and row["alert_schedule"])
-    )
-    if not should_send:
-        return
-
-    phone   = row["phone"]
-    message = build_alert_message(alert_type, city, soil, temp, advice)
-
-    if row["whatsapp_enabled"] and phone:
-        threading.Thread(
-            target=send_whatsapp, args=(phone, message), daemon=True
-        ).start()
-
-    if row["sms_enabled"] and phone:
-        threading.Thread(
-            target=send_sms, args=(phone, message), daemon=True
-        ).start()
-
-# ---------------------------------------------------------------------------
-# Scheduled Irrigation (Feature 4)
-# ---------------------------------------------------------------------------
-_scheduler_started = threading.Event()   # prevents duplicate scheduler threads
-
-def run_schedule(schedule: dict):
-    city     = schedule["city"]
-    duration = schedule["duration_min"]
-    name     = schedule["name"]
-    log.info("Running schedule: %s for %d min in %s", name, duration, city)
-
-    try:
-        w    = fetch_weather(city)
-        soil = read_soil_moisture()
-    except Exception as e:
-        log.warning("Schedule %s: could not fetch conditions: %s", name, e)
-        soil = 50
-        w    = {"temp": 25, "humidity": 60, "rain_1h": 0, "description": "Unknown"}
-
-    if w.get("rain_1h", 0) > 2:
-        log.info("Schedule %s skipped - rain detected", name)
-        return
-    if soil > 70:
-        log.info("Schedule %s skipped - soil already moist (%d%%)", name, soil)
-        return
-
-    control_pump(True)
-
-    try:
-        conn = get_db()
-        conn.execute(
-            """INSERT INTO logs (city, moisture, pump_on, advice, temp, humidity, rain)
-               VALUES (?, ?, 1, ?, ?, ?, ?)""",
-            (city, soil, f"Scheduled: {name}", w["temp"],
-             w["humidity"], w.get("rain_1h", 0)))
-        conn.execute(
-            "UPDATE schedules SET last_run=? WHERE id=?",
-            (datetime.now().strftime("%Y-%m-%d %H:%M"), schedule["id"]))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log.error("Schedule %s: DB write failed: %s", name, e)
-
-    def stop_after_duration():
-        time.sleep(duration * 60)
-        control_pump(False)
-        log.info("Schedule %s completed after %d min", name, duration)
-
-    threading.Thread(target=stop_after_duration, daemon=True).start()
-
-def scheduler_loop():
-    """
-    Background scheduler - checks active schedules every minute.
-    The _scheduler_started Event ensures only ONE instance ever runs,
-    even if the module is imported multiple times (e.g. with gunicorn --preload).
-    """
-    log.info("Background scheduler started")
-
-    while True:
-        try:
-            now      = datetime.now()
-            now_time = now.strftime("%H:%M")
-            now_day  = now.strftime("%a")
-
-            conn      = get_db()
-            schedules = conn.execute(
-                "SELECT * FROM schedules WHERE active=1"
-            ).fetchall()
-            conn.close()
-
-            for s in schedules:
-                s    = dict(s)
-                days = json.loads(s["days"])
-                if s["run_time"] == now_time and now_day in days:
-                    last = s.get("last_run") or ""
-                    if not last.startswith(now.strftime("%Y-%m-%d %H:%M")):
-                        threading.Thread(
-                            target=run_schedule, args=(s,), daemon=True
-                        ).start()
-
-        except Exception as e:
-            log.error("Scheduler loop error: %s", e)
-
-        time.sleep(60)
-
-def start_scheduler_once():
-    """Start the scheduler thread only if it has not been started yet."""
-    if not _scheduler_started.is_set():
-        _scheduler_started.set()
-        threading.Thread(target=scheduler_loop, daemon=True).start()
-
-start_scheduler_once()
-
-# ---------------------------------------------------------------------------
-# Weather Helpers
-# ---------------------------------------------------------------------------
-def fetch_weather(city: str) -> dict:
-    r = req.get(
-        "https://api.openweathermap.org/data/2.5/weather",
-        params={"q": city, "appid": OWM_KEY, "units": "metric"},
-        timeout=8)
-    r.raise_for_status()
-    d = r.json()
-    w = {
-        "city":        d["name"],
-        "country":     d["sys"]["country"],
-        "temp":        round(d["main"]["temp"], 1),
-        "feels_like":  round(d["main"]["feels_like"], 1),
-        "humidity":    d["main"]["humidity"],
-        "description": d["weather"][0]["description"].title(),
-        "icon":        d["weather"][0]["icon"],
-        "wind_speed":  round(d["wind"]["speed"] * 3.6, 1),
-        "pressure":    d["main"]["pressure"],
-        "clouds":      d["clouds"]["all"],
-        "rain_1h":     d.get("rain", {}).get("1h", 0),
-        # Sunrise/sunset converted to Nigeria local time (Africa/Lagos)
-        "sunrise":     utc_ts_to_local(d["sys"]["sunrise"]),
-        "sunset":      utc_ts_to_local(d["sys"]["sunset"]),
-        "online":      True,
-    }
-    try:
-        conn = get_db()
-        conn.execute(
-            """INSERT INTO weather_cache
-               (city,temp,humidity,description,wind_speed,feels_like,
-                pressure,clouds,rain_1h,icon)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            (w["city"], w["temp"], w["humidity"], w["description"],
-             w["wind_speed"], w["feels_like"], w["pressure"],
-             w["clouds"], w["rain_1h"], w["icon"]))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        log.error("Weather cache write failed: %s", e)
-    return w
-
-def fetch_forecast(city: str) -> list:
-    r = req.get(
-        "https://api.openweathermap.org/data/2.5/forecast",
-        params={"q": city, "appid": OWM_KEY, "units": "metric", "cnt": 40},
-        timeout=8)
-    r.raise_for_status()
-    data  = r.json()
-    daily = {}
-    for item in data["list"]:
-        day = item["dt_txt"].split()[0]
-        if day not in daily:
-            daily[day] = {
-                "temps": [], "hum": [], "rain": 0,
-                "icon": item["weather"][0]["icon"],
-                "desc": item["weather"][0]["description"].title(),
-            }
-        daily[day]["temps"].append(item["main"]["temp"])
-        daily[day]["hum"].append(item["main"]["humidity"])
-        daily[day]["rain"] += item.get("rain", {}).get("3h", 0)
-    out = []
-    for day, d in list(daily.items())[:7]:
-        out.append({
-            "day":      datetime.strptime(day, "%Y-%m-%d").strftime("%a %d"),
-            "temp_max": round(max(d["temps"]), 1),
-            "temp_min": round(min(d["temps"]), 1),
-            "humidity": round(sum(d["hum"]) / len(d["hum"])),
-            "rain_mm":  round(d["rain"], 1),
-            "icon":     d["icon"],
-            "desc":     d["desc"],
-        })
-    return out
-
-def get_cached_weather() -> dict | None:
-    try:
-        conn = get_db()
-        row  = conn.execute(
-            "SELECT * FROM weather_cache ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        conn.close()
-        if row:
-            d = dict(row); d["online"] = False; return d
-    except Exception as e:
-        log.error("Cached weather lookup failed: %s", e)
-    return None
-
-def rule_advice(temp, humidity, soil, rain):
-    if rain > 2:
-        return "Rain detected - skip irrigation", False, "rain"
-    if soil < 25 and temp > 32:
-        return "Critical: max irrigation needed immediately!", True, "critical"
-    if soil < 35:
-        return "High irrigation needed - soil very dry", True, None
-    if soil < 50:
-        return "Moderate irrigation recommended", True, None
-    if soil > 70:
-        return "Soil well-moistened - no irrigation needed", False, None
-    if humidity > 85:
-        return "High humidity - skip irrigation", False, None
-    return "Light irrigation recommended", False, None
-
-def gpt_advice(temp, humidity, soil, rain, desc, city) -> str:
-    if not ai_client:
-        return "Install OpenAI: pip install openai"
-    try:
-        r = ai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content":
-                f"You are AquaMind, AI irrigation advisor for Crop Skyyy.\n"
-                f"Farm: {city} | Temp:{temp}C | Humidity:{humidity}% | "
-                f"Soil:{soil}% | Rain:{rain}mm | Weather:{desc}\n"
-                f"Give 2-3 sentence practical irrigation advice. Include: "
-                f"irrigate yes/no, best timing, one water-saving tip."}],
-            max_tokens=180,
-            temperature=0.6,
-        )
-        return r.choices[0].message.content.strip()
-    except Exception as e:
-        log.error("GPT advice failed: %s", e)
-        return f"AI advice unavailable: {e}"
-
-# ---------------------------------------------------------------------------
-# Routes - Auth
-# ---------------------------------------------------------------------------
-@app.route("/")
-def index():
-    from flask import make_response
-    resp = make_response(HTML_PAGE)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    return resp
-
     def pulse():
         control_pump(True)
         time.sleep(2)
