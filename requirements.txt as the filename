@@ -1,0 +1,9 @@
+flask==3.0.3
+requests==2.32.3
+openai==1.30.5
+werkzeug==3.0.3
+pytz==2024.1
+flask-limiter==3.7.0
+pyserial==3.5
+twilio==9.3.3
+gunicorn==22.0.0
