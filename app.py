@@ -80,8 +80,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 # --- API Keys (unchanged from original) ---
-OWM_KEY    = "OPENAI_KEY = os.getenv("OPENAI_KEY", "")
-
+OWM_KEY    = "2f125e80f1a3689c2397593b7ad989a0
+OPENAI_KEY = os.getenv("OPENAI_KEY", "")
 # --- Twilio WhatsApp / SMS (sign up free at twilio.com) ---
 TWILIO_SID   = "YOUR_TWILIO_ACCOUNT_SID"
 TWILIO_TOKEN = "YOUR_TWILIO_AUTH_TOKEN"
